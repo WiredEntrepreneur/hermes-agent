@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Mapping
 
@@ -28,11 +29,39 @@ class AntigravityAdapter:
         self.executable = executable
         self.timeout_seconds = timeout_seconds
 
-    def build_argv(self, prompt: str) -> list[str]:
+    def build_argv(self, prompt: str, project_id: str) -> list[str]:
         return [
-            self.executable, "--new-project", "--model", self.model, "--effort", self.effort,
-            "--mode", self.mode, "--sandbox", "--output-format", "json", "--print", prompt,
+            self.executable,
+            "--project", project_id,
+            "--model", self.model,
+            "--effort", self.effort,
+            "--mode", self.mode,
+            "--sandbox",
+            "--output-format", "json",
+            "--print", prompt,
         ]
+
+    @staticmethod
+    def _write_bounded_project(workspace: str, env: Mapping[str, str]) -> tuple[str, Path]:
+        """Create an invocation-scoped agy project with sandboxed command grants."""
+        project_id = str(uuid.uuid4())
+        projects_dir = Path(env.get("HOME", str(Path.home()))) / ".gemini" / "config" / "projects"
+        projects_dir.mkdir(parents=True, exist_ok=True)
+        project_path = projects_dir / f"{project_id}.json"
+        payload = {
+            "id": project_id,
+            "name": f"hermes-worker-{project_id}",
+            "projectResources": {"resources": [{"folderUri": Path(workspace).resolve().as_uri()}]},
+            "permissionGrants": {"permissionGrants": {"allow": ["command(*)"]}},
+            "settings": {
+                "fileAccessPolicy": "AGENT_SETTING_POLICY_ASK",
+                "sandboxMode": True,
+                "autoExecutionPolicy": "CASCADE_COMMANDS_AUTO_EXECUTION_PROCEED_IN_SANDBOX",
+            },
+            "isWorkspaceOnly": True,
+        }
+        project_path.write_text(json.dumps(payload), encoding="utf-8")
+        return project_id, project_path
 
     def run(self, prompt: str, workspace: str, *, env: Mapping[str, str] | None = None) -> ExternalCliResult:
         if not shutil.which(self.executable) and not Path(self.executable).is_file():
@@ -40,15 +69,20 @@ class AntigravityAdapter:
         # agy is a reasoning child, never a Kanban worker.  The helper removes
         # the task/run authority while retaining ordinary auth/location env.
         child_env = delegated_child_subprocess_env(env or os.environ)
+        project_path = None
         try:
+            project_id, project_path = self._write_bounded_project(workspace, child_env)
             completed = subprocess.run(
-                self.build_argv(prompt), cwd=workspace, env=child_env,
+                self.build_argv(prompt, project_id), cwd=workspace, env=child_env,
                 capture_output=True, text=True, timeout=self.timeout_seconds, shell=False,
             )
         except subprocess.TimeoutExpired as exc:
             return ExternalCliResult(ResultStatus.TIMEOUT, stderr=(exc.stderr or "") if isinstance(exc.stderr, str) else "")
         except OSError as exc:
             return ExternalCliResult(ResultStatus.CLI_ERROR, stderr=str(exc))
+        finally:
+            if project_path is not None:
+                project_path.unlink(missing_ok=True)
         if completed.returncode != 0:
             return ExternalCliResult(ResultStatus.CLI_ERROR, exit_code=completed.returncode, stderr=completed.stderr)
         try:
