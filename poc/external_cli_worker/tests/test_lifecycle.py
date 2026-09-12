@@ -3,7 +3,7 @@ from pathlib import Path
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect_closing
 
-from poc.external_cli_worker.lifecycle import complete_marker_task, sanitized_metadata
+from poc.external_cli_worker.lifecycle import complete_marker_task, handle_marker_result, sanitized_metadata
 from poc.external_cli_worker.result import ExternalCliResult, ResultStatus
 
 
@@ -33,11 +33,32 @@ def test_correct_marker_completes_current_run_and_metadata_has_no_environment(tm
     assert not ({"env", "stderr", "authorization"} & metadata.keys())
 
 
-def test_wrong_marker_and_stale_run_cannot_complete(tmp_path):
+def test_wrong_marker_produces_truthful_failure_evidence(tmp_path):
     db, task_id, run_id = _claimed(tmp_path)
     wrong = ExternalCliResult(ResultStatus.SUCCESS, "DIFFERENT_MARKER_B")
-    assert not complete_marker_task(db, task_id, run_id, wrong, Adapter())
-    right = ExternalCliResult(ResultStatus.SUCCESS, "HERMES_AGY_ROUNDTRIP_OK")
-    assert not complete_marker_task(db, task_id, run_id + 99, right, Adapter())
+    assert handle_marker_result(task_id, run_id, wrong, Adapter(), {"db_path": str(db)})
     with connect_closing(db) as conn:
-        assert kb.get_task(conn, task_id).status == "running"
+        task = kb.get_task(conn, task_id)
+        run = conn.execute("SELECT outcome, summary FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        assert task.status == "blocked"
+        assert run["outcome"] == "blocked"
+        assert "CONTRACT_MISMATCH" in run["summary"]
+        assert "SUCCESS" not in run["summary"]
+
+
+def test_stale_run_cannot_complete_newer_run(tmp_path):
+    db, task_id, stale_run_id = _claimed(tmp_path)
+    with connect_closing(db) as conn:
+        assert kb.block_task(
+            conn, task_id, reason="supersede test run", kind="capability",
+            expected_run_id=stale_run_id,
+        )
+        assert kb.unblock_task(conn, task_id)
+        newer = kb.claim_task(conn, task_id)
+        assert newer.current_run_id != stale_run_id
+    right = ExternalCliResult(ResultStatus.SUCCESS, "HERMES_AGY_ROUNDTRIP_OK")
+    assert not complete_marker_task(db, task_id, stale_run_id, right, Adapter())
+    with connect_closing(db) as conn:
+        task = kb.get_task(conn, task_id)
+        assert task.status == "running"
+        assert task.current_run_id == newer.current_run_id

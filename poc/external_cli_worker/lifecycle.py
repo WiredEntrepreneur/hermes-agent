@@ -10,6 +10,7 @@ from hermes_cli.kanban_db_connect import connect_closing
 from .result import ExternalCliResult
 
 EXPECTED_MARKER = "HERMES_AGY_ROUNDTRIP_OK"
+POC_PROMPT = f"Return exactly {EXPECTED_MARKER} and perform no other work."
 
 
 def sanitized_metadata(result: ExternalCliResult, adapter) -> dict:
@@ -38,7 +39,26 @@ def complete_marker_task(db_path: Path, task_id: str, run_id: int, result: Exter
         )
 
 
-def fail_closed(db_path: Path, task_id: str, run_id: int, result: ExternalCliResult) -> bool:
+def fail_closed(db_path: Path, task_id: str, run_id: int, failure_status: str,
+                detail: str | None = None) -> bool:
     """Leave durable failure evidence without ever converting a bad result to done."""
+    reason = f"external-cli {failure_status}"
+    if detail:
+        reason += f": {detail}"
     with connect_closing(db_path) as conn:
-        return bool(kb.block_task(conn, task_id, reason=f"external-cli {result.status.value}", kind="capability", expected_run_id=run_id))
+        return bool(kb.block_task(
+            conn, task_id, reason=reason, kind="capability", expected_run_id=run_id,
+        ))
+
+
+def handle_marker_result(task_id: str, run_id: int, result: ExternalCliResult,
+                         adapter, context: dict) -> bool:
+    """Apply the marker PoC contract; the generic lane only delivers here."""
+    db_path = Path(context["db_path"])
+    if not result.succeeded:
+        return fail_closed(db_path, task_id, run_id, result.status.value)
+    if result.response is None or result.response.strip() != EXPECTED_MARKER:
+        return fail_closed(
+            db_path, task_id, run_id, "CONTRACT_MISMATCH", "unexpected_response",
+        )
+    return complete_marker_task(db_path, task_id, run_id, result, adapter)
