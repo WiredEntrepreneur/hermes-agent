@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
@@ -66,14 +67,21 @@ The result is a claim that the host will validate; it does not control Hermes li
 """
 
 
-def _antigravity_spawn(task, workspace: str, *, board: str | None = None) -> Optional[int]:
+def _antigravity_spawn(
+    task,
+    workspace: str,
+    *,
+    board: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+) -> Optional[int]:
     instruction = _task_instruction(task)
     if not instruction:
         raise ValueError("external antigravity lane requires a non-empty Kanban task instruction")
     from hermes_cli import kanban_db as kb
 
     lane = ExternalCliWorkerLane(
-        AntigravityAdapter(),
+        AntigravityAdapter(model=model, effort=effort),
         prompt=_worker_prompt(instruction),
         result_handler=handle_worker_result,
         result_context={
@@ -88,6 +96,9 @@ def _antigravity_spawn(task, workspace: str, *, board: str | None = None) -> Opt
 # This is intentionally a tiny, code-owned registry.  Configuration selects
 # an adapter identifier only; it never supplies executable paths or argv.
 _ADAPTER_REGISTRY: dict[str, Callable] = {"antigravity": _antigravity_spawn}
+
+_ANTIGRAVITY_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+_ANTIGRAVITY_EFFORTS = frozenset({"low", "medium", "high"})
 
 
 def resolve_external_worker_route(assignee: str, config: Mapping[str, Any]) -> ExternalWorkerRoute:
@@ -105,7 +116,37 @@ def resolve_external_worker_route(assignee: str, config: Mapping[str, Any]) -> E
     if entry.get("type") != "external_cli":
         return ExternalWorkerRoute(configured=True, spawn=None)
     adapter = entry.get("adapter")
-    return ExternalWorkerRoute(configured=True, spawn=_ADAPTER_REGISTRY.get(adapter))
+    spawn = _ADAPTER_REGISTRY.get(adapter)
+    if spawn is None:
+        return ExternalWorkerRoute(configured=True, spawn=None)
+
+    model = entry.get("model", AntigravityAdapter.default_model)
+    effort = entry.get("effort", AntigravityAdapter.default_effort)
+    if not isinstance(model, str):
+        return ExternalWorkerRoute(configured=True, spawn=None)
+    if not isinstance(effort, str):
+        return ExternalWorkerRoute(configured=True, spawn=None)
+    model = model.strip()
+    effort = effort.strip()
+    if _ANTIGRAVITY_MODEL_RE.fullmatch(model) is None:
+        return ExternalWorkerRoute(configured=True, spawn=None)
+    if effort not in _ANTIGRAVITY_EFFORTS:
+        return ExternalWorkerRoute(configured=True, spawn=None)
+
+    if adapter == "antigravity":
+
+        def configured_spawn(task, workspace: str, *, board: str | None = None):
+            return spawn(
+                task,
+                workspace,
+                board=board,
+                model=model,
+                effort=effort,
+            )
+
+        return ExternalWorkerRoute(configured=True, spawn=configured_spawn)
+
+    return ExternalWorkerRoute(configured=True, spawn=spawn)
 
 
 def configured_route_for_assignee(assignee: str) -> ExternalWorkerRoute:

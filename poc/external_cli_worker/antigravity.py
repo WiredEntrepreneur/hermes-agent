@@ -18,16 +18,27 @@ from .result import ExternalCliResult, ResultStatus
 class AntigravityAdapter:
     """Run the pinned PoC request through ``agy`` and normalize its response."""
 
-    model = "gemini-3.8-flash-medium"
-    effort = "medium"
+    default_model = "gemini-3.8-flash-medium"
+    default_effort = "medium"
+    model = default_model
+    effort = default_effort
     mode = "accept-edits"
     provider = "gemini"
     sandbox_enabled = True
     output_format = "json"
 
-    def __init__(self, executable: str = "/home/rsomarouthu/.local/bin/agy", timeout_seconds: int = 120):
+    def __init__(
+        self,
+        executable: str = "/home/rsomarouthu/.local/bin/agy",
+        timeout_seconds: int = 120,
+        *,
+        model: str | None = None,
+        effort: str | None = None,
+    ):
         self.executable = executable
         self.timeout_seconds = timeout_seconds
+        self.model = self.default_model if model is None else model
+        self.effort = self.default_effort if effort is None else effort
 
     def build_argv(self, prompt: str, project_id: str) -> list[str]:
         return [

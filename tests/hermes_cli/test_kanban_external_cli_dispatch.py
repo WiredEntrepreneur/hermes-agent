@@ -37,7 +37,7 @@ def test_antigravity_spawn_uses_normal_task_intent_and_worker_result_policy(monk
             return 4321
 
     monkeypatch.setattr(external, "ExternalCliWorkerLane", FakeLane)
-    monkeypatch.setattr(external, "AntigravityAdapter", lambda: object())
+    monkeypatch.setattr(external, "AntigravityAdapter", lambda **kwargs: SimpleNamespace(**kwargs))
     monkeypatch.setattr("hermes_cli.kanban_db.kanban_db_path", lambda board=None: tmp_path / "kanban.db")
     task = SimpleNamespace(
         id="t_general", current_run_id=7, assignee="gemini-worker",
@@ -50,6 +50,72 @@ def test_antigravity_spawn_uses_normal_task_intent_and_worker_result_policy(monk
     assert "Return exactly" not in seen["prompt"]
     assert seen["result_handler"] is handle_worker_result
     assert seen["result_context"]["workspace"] == str(tmp_path)
+
+
+def test_external_lane_passes_configured_model_and_effort(monkeypatch, tmp_path):
+    import poc.external_cli_worker.dispatch as external
+
+    seen = {}
+
+    class FakeLane:
+        def __init__(self, adapter, **kwargs):
+            seen.update(adapter=adapter, **kwargs)
+
+        def spawn(self, task, workspace, board=None):
+            seen.update(task=task, workspace=workspace, board=board)
+            return 2468
+
+    monkeypatch.setattr(external, "ExternalCliWorkerLane", FakeLane)
+    monkeypatch.setattr("hermes_cli.kanban_db.kanban_db_path", lambda board=None: tmp_path / "kanban.db")
+
+    route = external.resolve_external_worker_route(
+        "gemini-worker",
+        {
+            "external_worker_lanes": {
+                "gemini-worker": {
+                    "type": "external_cli",
+                    "adapter": "antigravity",
+                    "model": "gemini-3.1-pro-high",
+                    "effort": "high",
+                },
+            },
+        },
+    )
+
+    assert route.configured
+    assert route.spawn is not None
+
+    task = SimpleNamespace(
+        id="t_config", assignee="gemini-worker",
+        title="Implement the configured change", body="",
+    )
+    assert route.spawn(task, str(tmp_path), board="work") == 2468
+
+    argv = seen["adapter"].build_argv("prompt", "project-id")
+    assert argv[argv.index("--model") + 1] == "gemini-3.1-pro-high"
+    assert argv[argv.index("--effort") + 1] == "high"
+    assert seen["workspace"] == str(tmp_path)
+    assert seen["board"] == "work"
+
+
+def test_malformed_model_or_effort_fails_closed():
+    invalid_options = (
+        {"model": ""},
+        {"model": "   "},
+        {"model": None},
+        {"model": "gemini invalid/model"},
+        {"effort": "ultra"},
+        {"effort": None},
+    )
+
+    for options in invalid_options:
+        route = resolve_external_worker_route(
+            "gemini-worker",
+            {"external_worker_lanes": {"gemini-worker": {
+                "type": "external_cli", "adapter": "antigravity", **options,
+            }}},
+        )
+        assert route == ExternalWorkerRoute(True, None)
 
 
 def test_unknown_or_malformed_external_lane_is_configured_but_fails_closed():
@@ -74,8 +140,12 @@ def test_normal_dispatch_selects_configured_external_lane_before_placeholder_pro
     workspace.mkdir()
     seen = {}
 
-    def external_spawn(task, resolved_workspace, *, board=None):
-        seen.update(task_id=task.id, run_id=task.current_run_id, workspace=resolved_workspace, board=board)
+    def external_spawn(task, resolved_workspace, *, board=None, model=None, effort=None):
+        seen.update(
+            task_id=task.id, run_id=task.current_run_id,
+            workspace=resolved_workspace, board=board,
+            model=model, effort=effort,
+        )
         return 424242
 
     monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: _config({
@@ -98,6 +168,8 @@ def test_normal_dispatch_selects_configured_external_lane_before_placeholder_pro
     assert seen["task_id"] == task_id
     assert seen["run_id"] == task.current_run_id
     assert seen["workspace"] == str(workspace)
+    assert seen["model"] == "gemini-3.8-flash-medium"
+    assert seen["effort"] == "medium"
     assert task.worker_pid == 424242
 
 
@@ -119,7 +191,7 @@ def test_normal_dispatch_can_complete_general_worker_result_with_host_owned_ids(
         model, effort, mode = "gemini-3.8-flash-medium", "medium", "accept-edits"
         provider, sandbox_enabled, output_format = "gemini", True, "json"
 
-    def external_spawn(task, resolved_workspace, *, board=None):
+    def external_spawn(task, resolved_workspace, *, board=None, **_adapter_options):
         response = json.dumps({
             "schema_version": "1.0", "outcome": "COMPLETED",
             "summary": "Implemented and tested clamp.",
@@ -184,22 +256,30 @@ def test_native_profiles_and_disabled_gemini_keep_normal_spawn_path(monkeypatch,
     assert len(result.skipped_nonspawnable) == 1
 
 
-def test_unknown_adapter_does_not_fall_back_to_native_spawn(monkeypatch, tmp_path):
+def test_invalid_external_config_does_not_fall_back_to_native_spawn(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_dispatch as kbd
 
-    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: _config({
-        "gemini-worker": {"type": "external_cli", "adapter": "not-registered"},
-    }))
     monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _name: True)
     monkeypatch.setattr(kbd, "_default_spawn", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("fallback")))
-    with kbc.connect_closing(tmp_path / "kanban.db") as conn:
-        task_id = kb.create_task(conn, title="x", assignee="gemini-worker", initial_status="blocked")
-        assert kb.unblock_task(conn, task_id)
-        result = kbd.dispatch_once(conn, reconcile_orphans=False)
-        assert kb.get_task(conn, task_id).status == "ready"
-    assert result.skipped_nonspawnable == [task_id]
+    invalid_entries = (
+        {"type": "external_cli", "adapter": "not-registered"},
+        {"type": "external_cli", "adapter": "antigravity", "effort": "ultra"},
+    )
+    for index, entry in enumerate(invalid_entries):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda entry=entry: _config({"gemini-worker": entry}),
+        )
+        with kbc.connect_closing(tmp_path / f"kanban-{index}.db") as conn:
+            task_id = kb.create_task(
+                conn, title="x", assignee="gemini-worker", initial_status="blocked",
+            )
+            assert kb.unblock_task(conn, task_id)
+            result = kbd.dispatch_once(conn, reconcile_orphans=False)
+            assert kb.get_task(conn, task_id).status == "ready"
+        assert result.skipped_nonspawnable == [task_id]
 
 
 def test_external_exact_contract_mismatch_blocks_the_current_run(monkeypatch, tmp_path):
@@ -212,7 +292,7 @@ def test_external_exact_contract_mismatch_blocks_the_current_run(monkeypatch, tm
     class Adapter:
         model, effort, mode = "gemini-3.8-flash-medium", "medium", "accept-edits"
 
-    def external_spawn(task, workspace, *, board=None):
+    def external_spawn(task, workspace, *, board=None, **_adapter_options):
         handle_exact_response_result(
             task.id, task.current_run_id,
             ExternalCliResult(ResultStatus.SUCCESS, "DIFFERENT_B"), Adapter(),
