@@ -30,7 +30,7 @@ class AntigravityAdapter:
 
     def build_argv(self, prompt: str) -> list[str]:
         return [
-            self.executable, "--model", self.model, "--effort", self.effort,
+            self.executable, "--new-project", "--model", self.model, "--effort", self.effort,
             "--mode", self.mode, "--sandbox", "--output-format", "json", "--print", prompt,
         ]
 
