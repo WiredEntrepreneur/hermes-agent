@@ -19,7 +19,7 @@ class AntigravityAdapter:
 
     model = "gemini-3.8-flash-medium"
     effort = "medium"
-    mode = "plan"
+    mode = "accept-edits"
     provider = "gemini"
     sandbox_enabled = True
     output_format = "json"

@@ -25,7 +25,7 @@ def test_argv_is_pinned_and_adapter_uses_workspace_and_no_shell(tmp_path, monkey
     assert result.status is ResultStatus.SUCCESS
     assert calls["cwd"] == str(tmp_path)
     assert calls["shell"] is False
-    assert adapter.build_argv("x") == [adapter.executable, "--model", "gemini-3.8-flash-medium", "--effort", "medium", "--mode", "plan", "--sandbox", "--output-format", "json", "--print", "x"]
+    assert adapter.build_argv("x") == [adapter.executable, "--model", "gemini-3.8-flash-medium", "--effort", "medium", "--mode", "accept-edits", "--sandbox", "--output-format", "json", "--print", "x"]
 
 
 def test_result_failures_fail_closed(tmp_path):

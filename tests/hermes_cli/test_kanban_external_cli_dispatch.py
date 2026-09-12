@@ -116,7 +116,7 @@ def test_normal_dispatch_can_complete_general_worker_result_with_host_owned_ids(
     (workspace / "math_utils.py").write_text("def clamp(value, lower, upper): ...\n")
 
     class Adapter:
-        model, effort, mode = "gemini-3.8-flash-medium", "medium", "plan"
+        model, effort, mode = "gemini-3.8-flash-medium", "medium", "accept-edits"
         provider, sandbox_enabled, output_format = "gemini", True, "json"
 
     def external_spawn(task, resolved_workspace, *, board=None):
@@ -210,7 +210,7 @@ def test_external_exact_contract_mismatch_blocks_the_current_run(monkeypatch, tm
     from poc.external_cli_worker.result import ExternalCliResult, ResultStatus
 
     class Adapter:
-        model, effort, mode = "gemini-3.8-flash-medium", "medium", "plan"
+        model, effort, mode = "gemini-3.8-flash-medium", "medium", "accept-edits"
 
     def external_spawn(task, workspace, *, board=None):
         handle_exact_response_result(
