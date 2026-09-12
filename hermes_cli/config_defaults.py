@@ -1696,6 +1696,10 @@ DEFAULT_CONFIG = {
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
     "kanban": {
+        # Explicit per-assignee external worker routes.  Empty disables the
+        # external CLI lane entirely; adapter names are resolved by a
+        # code-controlled registry, never a config-supplied command.
+        "external_worker_lanes": {},
         # Auto-subscribe the originating gateway/TUI session to completion + block events when
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.

@@ -38,3 +38,8 @@ def test_result_failures_fail_closed(tmp_path):
     for body, code, expected in cases:
         result = AntigravityAdapter(_fake_agy(tmp_path, body, code)).run("p", str(tmp_path))
         assert result.status is expected
+
+
+def test_missing_executable_is_a_cli_error_not_a_success(tmp_path):
+    result = AntigravityAdapter(str(tmp_path / "missing-agy")).run("p", str(tmp_path))
+    assert result.status is ResultStatus.CLI_ERROR

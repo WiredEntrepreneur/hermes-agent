@@ -1507,12 +1507,20 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    # Explicit external lanes have precedence over native profile resolution.
+    # A malformed/unknown configured lane is fail-closed: never fall through
+    # to a same-named profile and never accept a config-provided executable.
+    from poc.external_cli_worker.dispatch import configured_route_for_assignee
+    external_route = configured_route_for_assignee(assignee)
+    if external_route.configured and external_route.spawn is None:
+        result.skipped_nonspawnable.append(task_id)
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
     # it by assigning a profile, and health telemetry suppresses "stuck" for it.
     profile_exists = _profile_exists_fn()
-    if profile_exists is not None and not profile_exists(assignee):
+    if not external_route.configured and profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
         return False
     # Per-profile cap: one profile's local model / API quota / browser pool
@@ -1573,7 +1581,10 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+        selected_spawn = external_route.spawn if external_route.configured else (
+            spawn_fn if spawn_fn is not None else _default_spawn
+        )
+        pid = _call_spawn_fn(selected_spawn, claimed, str(workspace), board)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.

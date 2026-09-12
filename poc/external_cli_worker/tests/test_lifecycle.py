@@ -3,7 +3,9 @@ from pathlib import Path
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect_closing
 
-from poc.external_cli_worker.lifecycle import complete_marker_task, handle_marker_result, sanitized_metadata
+from poc.external_cli_worker.lifecycle import (
+    complete_marker_task, handle_exact_response_result, handle_marker_result, sanitized_metadata,
+)
 from poc.external_cli_worker.result import ExternalCliResult, ResultStatus
 
 
@@ -62,3 +64,17 @@ def test_stale_run_cannot_complete_newer_run(tmp_path):
         task = kb.get_task(conn, task_id)
         assert task.status == "running"
         assert task.current_run_id == newer.current_run_id
+
+
+def test_exact_response_handler_preserves_stale_run_fencing(tmp_path):
+    db, task_id, stale_run_id = _claimed(tmp_path)
+    with connect_closing(db) as conn:
+        assert kb.block_task(conn, task_id, reason="supersede", kind="capability", expected_run_id=stale_run_id)
+        assert kb.unblock_task(conn, task_id)
+        newer = kb.claim_task(conn, task_id)
+    assert not handle_exact_response_result(
+        task_id, stale_run_id, ExternalCliResult(ResultStatus.SUCCESS, "EXPECTED"), Adapter(),
+        {"db_path": str(db), "expected_response": "EXPECTED"},
+    )
+    with connect_closing(db) as conn:
+        assert kb.get_task(conn, task_id).current_run_id == newer.current_run_id
