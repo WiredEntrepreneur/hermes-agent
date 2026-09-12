@@ -20,6 +20,9 @@ class AntigravityAdapter:
     model = "gemini-3.8-flash-medium"
     effort = "medium"
     mode = "plan"
+    provider = "gemini"
+    sandbox_enabled = True
+    output_format = "json"
 
     def __init__(self, executable: str = "/home/rsomarouthu/.local/bin/agy", timeout_seconds: int = 120):
         self.executable = executable

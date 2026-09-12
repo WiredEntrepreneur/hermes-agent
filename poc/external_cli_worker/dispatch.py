@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
 from .antigravity import AntigravityAdapter
 from .lane import ExternalCliWorkerLane
-from .lifecycle import handle_exact_response_result
-
-
-_EXACT_RESPONSE_INSTRUCTION = re.compile(
-    r"^Return exactly (?P<response>\S+) and perform no other work\.$"
+from .lifecycle import handle_worker_result
+from .worker_result import (
+    MAX_ENTRY_LENGTH, MAX_LIST_ENTRIES, MAX_SUMMARY_LENGTH, MAX_TOTAL_BYTES,
 )
 
 
@@ -25,35 +22,64 @@ class ExternalWorkerRoute:
 
 
 def _task_instruction(task) -> str:
-    """Use bounded task content, preferring its detailed body when present."""
-    return (task.body or task.title or "").strip()
+    """Use the title/body intent already owned by the Kanban task."""
+    title = (task.title or "").strip()
+    body = (task.body or "").strip()
+    if body and body != title:
+        return f"TITLE:\n{title}\n\nDETAILS:\n{body}"
+    return body or title
 
 
-def _expected_response(instruction: str) -> Optional[str]:
-    match = _EXACT_RESPONSE_INSTRUCTION.fullmatch(instruction)
-    return match.group("response") if match else None
+def _worker_prompt(instruction: str) -> str:
+    return f"""You are a bounded engineering worker.
+
+Perform the task below within the supplied workspace and constraints.
+
+TASK:
+{instruction}
+
+Return ONLY one JSON object conforming to WorkerResult schema v1:
+{{
+  "schema_version": "1.0",
+  "outcome": "COMPLETED | REVIEW_REQUIRED | FAILED_RETRYABLE | FAILED_TERMINAL | BLOCKED",
+  "summary": "non-empty description of what actually happened",
+  "artifacts": [],
+  "evidence": [],
+  "findings": [],
+  "changed_files": [],
+  "tests": [],
+  "continuation": null
+}}
+
+Only schema_version, outcome, and summary are required. Optional list fields contain strings.
+COMPLETED means the task succeeded. REVIEW_REQUIRED means bounded work finished but needs review.
+FAILED_RETRYABLE means the same work may succeed on another attempt. FAILED_TERMINAL means retrying
+the unchanged task will not succeed. BLOCKED means external action or a prerequisite is required.
+
+Bounds: the full JSON must be at most {MAX_TOTAL_BYTES} UTF-8 bytes; summary at most
+{MAX_SUMMARY_LENGTH} characters; each list at most {MAX_LIST_ENTRIES} entries; every list entry
+and continuation at most {MAX_ENTRY_LENGTH} characters.
+
+Do not include markdown fences or commentary outside the JSON. Do not invent task IDs, run IDs,
+lifecycle fields, commands, files, tests, or evidence. Do not report paths outside the workspace.
+The result is a claim that the host will validate; it does not control Hermes lifecycle.
+"""
 
 
 def _antigravity_spawn(task, workspace: str, *, board: str | None = None) -> Optional[int]:
     instruction = _task_instruction(task)
-    # The task title is the durable, operator-visible exact-output contract;
-    # its optional body remains the bounded worker instruction.  With no body,
-    # the title deliberately serves both roles for the minimal PoC flow.
-    expected_response = _expected_response((task.title or "").strip())
-    if expected_response is None:
-        raise ValueError(
-            "external antigravity lane requires task instruction: "
-            "'Return exactly <token> and perform no other work.'"
-        )
+    if not instruction:
+        raise ValueError("external antigravity lane requires a non-empty Kanban task instruction")
     from hermes_cli import kanban_db as kb
 
     lane = ExternalCliWorkerLane(
         AntigravityAdapter(),
-        prompt=instruction,
-        result_handler=handle_exact_response_result,
+        prompt=_worker_prompt(instruction),
+        result_handler=handle_worker_result,
         result_context={
             "db_path": str(kb.kanban_db_path(board=board)),
-            "expected_response": expected_response,
+            "workspace": workspace,
+            "worker": task.assignee,
         },
     )
     return lane.spawn(task, workspace, board=board)

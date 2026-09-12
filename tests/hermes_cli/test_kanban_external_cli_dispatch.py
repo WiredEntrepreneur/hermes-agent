@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from poc.external_cli_worker.dispatch import ExternalWorkerRoute, resolve_external_worker_route
 
 
@@ -18,6 +20,36 @@ def test_external_lane_config_is_disabled_by_default_and_never_accepts_commands(
         }}},
     )
     assert route.configured and route.spawn is not None
+
+
+def test_antigravity_spawn_uses_normal_task_intent_and_worker_result_policy(monkeypatch, tmp_path):
+    import poc.external_cli_worker.dispatch as external
+    from poc.external_cli_worker.lifecycle import handle_worker_result
+
+    seen = {}
+
+    class FakeLane:
+        def __init__(self, adapter, **kwargs):
+            seen.update(adapter=adapter, **kwargs)
+
+        def spawn(self, task, workspace, board=None):
+            seen.update(task=task, workspace=workspace, board=board)
+            return 4321
+
+    monkeypatch.setattr(external, "ExternalCliWorkerLane", FakeLane)
+    monkeypatch.setattr(external, "AntigravityAdapter", lambda: object())
+    monkeypatch.setattr("hermes_cli.kanban_db.kanban_db_path", lambda board=None: tmp_path / "kanban.db")
+    task = SimpleNamespace(
+        id="t_general", current_run_id=7, assignee="gemini-worker",
+        title="Implement clamp", body="Add tests and run them.",
+    )
+    assert external._antigravity_spawn(task, str(tmp_path), board="work") == 4321
+    assert "Implement clamp" in seen["prompt"]
+    assert "Add tests and run them." in seen["prompt"]
+    assert "WorkerResult schema v1" in seen["prompt"]
+    assert "Return exactly" not in seen["prompt"]
+    assert seen["result_handler"] is handle_worker_result
+    assert seen["result_context"]["workspace"] == str(tmp_path)
 
 
 def test_unknown_or_malformed_external_lane_is_configured_but_fails_closed():
@@ -55,7 +87,7 @@ def test_normal_dispatch_selects_configured_external_lane_before_placeholder_pro
 
     with kbc.connect_closing(tmp_path / "kanban.db") as conn:
         task_id = kb.create_task(
-            conn, title="Return exactly HERMES_NORMAL_DISPATCH_GEMINI_OK and perform no other work.",
+            conn, title="Inspect the assigned repository and implement the bounded utility task.",
             assignee="gemini-worker", workspace_kind="dir", workspace_path=str(workspace), initial_status="blocked",
         )
         assert kb.unblock_task(conn, task_id)
@@ -67,6 +99,64 @@ def test_normal_dispatch_selects_configured_external_lane_before_placeholder_pro
     assert seen["run_id"] == task.current_run_id
     assert seen["workspace"] == str(workspace)
     assert task.worker_pid == 424242
+
+
+def test_normal_dispatch_can_complete_general_worker_result_with_host_owned_ids(monkeypatch, tmp_path):
+    import json
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+    import poc.external_cli_worker.dispatch as external
+    from poc.external_cli_worker.lifecycle import handle_worker_result
+    from poc.external_cli_worker.result import ExternalCliResult, ResultStatus
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "math_utils.py").write_text("def clamp(value, lower, upper): ...\n")
+
+    class Adapter:
+        model, effort, mode = "gemini-3.8-flash-medium", "medium", "plan"
+        provider, sandbox_enabled, output_format = "gemini", True, "json"
+
+    def external_spawn(task, resolved_workspace, *, board=None):
+        response = json.dumps({
+            "schema_version": "1.0", "outcome": "COMPLETED",
+            "summary": "Implemented and tested clamp.",
+            "changed_files": ["math_utils.py"], "tests": ["3 passed"],
+        })
+        handle_worker_result(
+            task.id, task.current_run_id,
+            ExternalCliResult(ResultStatus.SUCCESS, response, "cid", 1.0, 1, {"total_tokens": 9}),
+            Adapter(),
+            {
+                "db_path": str(tmp_path / "kanban.db"), "workspace": resolved_workspace,
+                "worker": task.assignee,
+            },
+        )
+        return 5252
+
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: _config({
+        "gemini-worker": {"type": "external_cli", "adapter": "antigravity"},
+    }))
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _name: True)
+    monkeypatch.setitem(external._ADAPTER_REGISTRY, "antigravity", external_spawn)
+    with kbc.connect_closing(tmp_path / "kanban.db") as conn:
+        task_id = kb.create_task(
+            conn, title="Implement clamp in the assigned repository and run its tests.",
+            assignee="gemini-worker", workspace_kind="dir", workspace_path=str(workspace),
+            initial_status="blocked",
+        )
+        assert kb.unblock_task(conn, task_id)
+        result = kbd.dispatch_once(conn, reconcile_orphans=False)
+        task = kb.get_task(conn, task_id)
+        run = conn.execute(
+            "SELECT outcome, metadata FROM task_runs WHERE task_id = ?", (task_id,),
+        ).fetchone()
+    assert result.spawned == [(task_id, "gemini-worker", str(workspace))]
+    assert task.status == "done"
+    assert run["outcome"] == "completed"
+    assert json.loads(run["metadata"])["worker_result"]["outcome"] == "COMPLETED"
 
 
 def test_native_profiles_and_disabled_gemini_keep_normal_spawn_path(monkeypatch, tmp_path):
