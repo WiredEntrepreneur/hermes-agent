@@ -746,6 +746,9 @@ def _reap_prune_verdicts(repo_root: str, verdicts: list, stale_work_cutoff: floa
     preserved_stale: list = []
     kept_branches: set = set()
     for entry, mtime, force, verdict, lock_state in verdicts:
+        from hermes_cli.kanban_generation import is_generation_worktree
+        if is_generation_worktree(entry):
+            continue
         reason = _PRESERVE_REASONS.get(verdict)
         if reason:
             if mtime <= stale_work_cutoff:

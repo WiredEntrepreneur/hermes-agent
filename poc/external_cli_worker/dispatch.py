@@ -80,9 +80,14 @@ def _antigravity_spawn(
         raise ValueError("external antigravity lane requires a non-empty Kanban task instruction")
     from hermes_cli import kanban_db as kb
 
+    from pathlib import Path
+    from hermes_cli.kanban_generation_worker import source_context, review_prefix, review_instruction
+    source = source_context(task, workspace)
+    adapter = AntigravityAdapter(model=model, effort=effort)
+    adapter.command_prefix = review_prefix(source, Path.home())
     lane = ExternalCliWorkerLane(
-        AntigravityAdapter(model=model, effort=effort),
-        prompt=_worker_prompt(instruction),
+        adapter,
+        prompt=_worker_prompt(instruction + review_instruction(source)),
         result_handler=handle_worker_result,
         result_context={
             "db_path": str(kb.kanban_db_path(board=board)),

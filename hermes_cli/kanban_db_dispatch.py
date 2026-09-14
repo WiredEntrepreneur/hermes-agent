@@ -7,6 +7,8 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 
 from __future__ import annotations
 
+from hermes_cli import kanban_run_state as _runs
+
 import contextlib
 import os
 import re
@@ -480,7 +482,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
-                run_id = _kb._end_run(
+                run_id = _runs._end_run(
                     conn, tid, outcome="timed_out", status="timed_out",
                     error=error, metadata=payload,
                 )
@@ -586,7 +588,7 @@ def detect_stale_running(
             }
             payload.update(termination)
 
-            run_id = _kb._end_run(
+            run_id = _runs._end_run(
                 conn, tid,
                 outcome="stale", status="stale",
                 error=(
@@ -647,7 +649,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
                 "worker_pid": int(pid) if pid else None,
                 "now": now,
             }
-            run_id = _kb._end_run(
+            run_id = _runs._end_run(
                 conn, tid,
                 outcome="reclaimed", status="reclaimed",
                 error="orphaned running card (broken claim bookkeeping)",
@@ -837,7 +839,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
             )
             if cur.rowcount != 1:
                 continue
-            run_id = _kb._end_run(
+            run_id = _runs._end_run(
                 conn, row["id"],
                 outcome=dead.run_outcome, status=dead.run_outcome,
                 error=dead.error_text,
@@ -1049,7 +1051,7 @@ def _record_task_failure(
                 )
             # Timeout/crash path's caller already emitted its own event.
             if end_run:
-                run_id = _kb._end_run(
+                run_id = _runs._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error,
                     metadata={"failures": failures, "retry_status": retry_status},
                 )
@@ -1081,7 +1083,7 @@ def _record_task_failure(
         run_id = None
         if end_run:
             # Only the spawn path has an open run to close.
-            run_id = _kb._end_run(
+            run_id = _runs._end_run(
                 conn, task_id, outcome="gave_up", status="gave_up", error=error,
                 metadata={
                     "failures": failures,
@@ -1560,8 +1562,12 @@ def _dispatch_lane_task(
     if claimed is None:
         return False
     try:
+        from hermes_cli.kanban_generation import dispatch_workspace
         resolved_branch_name = None
-        if claimed.workspace_kind == "worktree":
+        generation_workspace = dispatch_workspace(conn, claimed)
+        if generation_workspace is not None:
+            workspace, resolved_branch_name = generation_workspace
+        elif claimed.workspace_kind == "worktree":
             workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
@@ -1585,6 +1591,8 @@ def _dispatch_lane_task(
             spawn_fn if spawn_fn is not None else _default_spawn
         )
         pid = _call_spawn_fn(selected_spawn, claimed, str(workspace), board)
+        from hermes_cli.kanban_generation import record_spawn
+        record_spawn(conn, claimed.current_run_id, pid)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
@@ -2264,7 +2272,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
+    from hermes_cli.kanban_generation_worker import source_context, review_prefix, worker_environment, review_instruction
+    source = source_context(task, workspace)
+    worker_environment(env, source)
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    if source is not None:
+        cmd[cmd.index("-q") + 1] += review_instruction(source)
+    cmd = review_prefix(source, Path.home()) + cmd
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
@@ -2275,7 +2289,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
+            cwd=workspace if source is not None or os.path.isdir(workspace) else None,
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,
