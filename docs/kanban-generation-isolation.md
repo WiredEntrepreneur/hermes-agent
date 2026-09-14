@@ -56,6 +56,12 @@ HEAD. Successful completion/review handoff requires clean, committed source; a
 review must also finish at its starting SHA. Failed/aborted dirty work is preserved
 and quarantined as `reconciliation_required` rather than passed to another RUN.
 
+Organizational grouping (`task_groups`, `hermes kanban group`) is a separate,
+scheduling-inert axis: a Generation card may be used as a group label for
+visibility, but `task_groups` never gates dispatch and does not replace the
+`generation_tasks` binding. See `website/docs/user-guide/features/kanban.md`
+("Grouping (organizational containment)").
+
 Native Generation workers require a local terminal backend and reject a conflicting
 profile terminal.cwd; they cannot silently use a remote/default checkout.
 

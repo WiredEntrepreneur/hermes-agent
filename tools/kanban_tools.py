@@ -492,14 +492,16 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
-    """Full task state: row, parents, children, comments, runs, last 50 events."""
+    """Full task state: row, parents, children, groups, comments, runs, last 50 events."""
     tid = _require_task_id(args)
     with _board(args.get("board")) as (kb, conn):
+        from hermes_cli import kanban_db_groups as kbg
         task = _existing_task(kb, conn, tid)
         return json.dumps({
             "task": _fields(task, _TASK_FIELDS),
             "parents": kb.parent_ids(conn, tid),
             "children": kb.child_ids(conn, tid),
+            "groups": kbg.group_ids(conn, tid),
             "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
             # Capped; full log via CLI.
             "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],

@@ -225,11 +225,16 @@ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "set-default-workdir", "import",
 })
 
+_DELEGATED_CHILD_DENIED_GROUP_ACTIONS: frozenset[str] = frozenset({"add", "remove"})
+
 
 def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
     action = getattr(args, "kanban_action", None)
     if action == "boards":
         if (getattr(args, "boards_action", None) or "list") not in _DELEGATED_CHILD_DENIED_BOARD_ACTIONS:
+            return False
+    elif action == "group":
+        if (getattr(args, "group_action", None) or "list") not in _DELEGATED_CHILD_DENIED_GROUP_ACTIONS:
             return False
     elif action not in _DELEGATED_CHILD_DENIED_ACTIONS:
         return False
@@ -365,7 +370,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
             project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
-            parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
+            parents=tuple(args.parent or ()), groups=tuple(args.group or ()),
+            triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
             max_retries=max_retries, model_override=getattr(args, "model_override", None),
@@ -426,6 +432,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
             conn, assignee=assignee, status=args.status, tenant=args.tenant, session_id=args.session,
             include_archived=args.archived, order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id, current_step_key=args.current_step_key,
+            group_id=getattr(args, "group", None),
         )
     if _json_out(args, [_task_to_dict(t) for t in tasks]):
         return 0
@@ -484,6 +491,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         events = kb.list_events(conn, args.task_id)
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
+        from hermes_cli import kanban_db_groups as kbg
+        groups = kbg.group_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
@@ -492,7 +501,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     if want_json:
         _print_json({
-            "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
+            "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents,
+            "children": children, "groups": groups,
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
@@ -540,6 +550,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         field("parents", ", ".join(parents))
     if children:
         field("children", ", ".join(children))
+    if groups:
+        field("groups", ", ".join(groups))
     if task.body:
         _print_section("Body:", [task.body])
     if task.result:
@@ -708,6 +720,61 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
         ok = kb.unlink_tasks(conn, args.parent_id, args.child_id)
     return _ok_or_err(ok, f"No such link: {args.parent_id} -> {args.child_id}",
                       f"Unlinked {args.parent_id} -> {args.child_id}")
+
+
+# --- Grouping (organizational containment, never a scheduling dependency) ---
+
+def _cmd_group(args: argparse.Namespace) -> int:
+    action = getattr(args, "group_action", None)
+    handler = _GROUP_HANDLERS.get(action)
+    if not handler:
+        return _err("kanban: group requires add, remove, or list", 2)
+    return handler(args)
+
+
+def _cmd_group_add(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_db_groups as kbg
+    with kbc.connect_closing() as conn:
+        added = kbg.add_task_group(conn, args.group_id, args.task_id, author=_profile_author())
+    if added:
+        print(f"Grouped {args.task_id} under {args.group_id}")
+    else:
+        print(f"{args.task_id} is already in group {args.group_id}")
+    return 0
+
+
+def _cmd_group_remove(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_db_groups as kbg
+    with kbc.connect_closing() as conn:
+        removed = kbg.remove_task_group(conn, args.group_id, args.task_id)
+    return _ok_or_err(removed, f"{args.task_id} is not in group {args.group_id}",
+                      f"Removed {args.task_id} from group {args.group_id}")
+
+
+def _cmd_group_list(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_db_groups as kbg
+    with kbc.connect_closing() as conn:
+        if kb.get_task(conn, args.group_id) is None:
+            return _err(f"no such task: {args.group_id}")
+        members = [kb.get_task(conn, tid) for tid in kbg.grouped_task_ids(conn, args.group_id)]
+    if _json_out(args, [
+        {"id": t.id, "title": t.title, "status": t.status, "assignee": t.assignee}
+        for t in members]):
+        return 0
+    if not members:
+        print(f"Group {args.group_id} has no members")
+        return 0
+    print(f"Group {args.group_id} ({len(members)} member{'s' if len(members) != 1 else ''}):")
+    for t in members:
+        print(f"  {t.id}  {t.status:8s}  @{t.assignee or '(unassigned)':18s}  {t.title}")
+    return 0
+
+
+_GROUP_HANDLERS = {
+    "add": _cmd_group_add,
+    "remove": _cmd_group_remove,
+    "list": _cmd_group_list,
+}
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
@@ -1235,7 +1302,7 @@ _HANDLERS = {
     "assign": _cmd_assign, "set-model": _cmd_set_model,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
-    "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
+    "link": _cmd_link, "unlink": _cmd_unlink, "group": _cmd_group, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,

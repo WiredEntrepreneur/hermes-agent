@@ -113,7 +113,8 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   below. Single-project users stay on the `default` board and never see the
   word "board" outside this docs section.
 - **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | review | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
-- **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`.
+- **Link** — `task_links` row recording a parent → child **execution dependency**. The dispatcher promotes `todo → ready` when all parents are `done`. A link is the *only* thing that can gate a task; see [Grouping](#grouping-organizational-containment) for the separate "belongs to" axis.
+- **Group** — `task_groups` row recording that a task **belongs to** another task (an EPIC / LOOP / GENERATION card). Organizational containment for visibility only: it never gates dispatch, never carries context handoff, and never participates in reopen invalidation. `unlink` does not remove group membership, and removing a group does not alter dependencies.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
 - **Workspace** — the directory a worker operates in. Three kinds:
   - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` are copied into durable per-task attachment storage before cleanup; existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. A missing declared scratch artifact keeps the task in-flight so the worker can correct the path and retry. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
@@ -994,6 +995,51 @@ The board supports these eight patterns without any new primitives:
 | **P9 Triage specifier** | rough idea → `triage` → `hermes kanban specify` expands body → `todo` | "turn this one-liner into a spec'd task" |
 
 For worked examples of each, see `docs/hermes-kanban-v1-spec.pdf`.
+
+## Grouping (organizational containment)
+
+A **group** records that a task *belongs to* another task — an EPIC, a LOOP, or a
+GENERATION card — for visibility and inspection. It is a deliberately separate
+axis from the parent link:
+
+| | `--parent` / `link` (`task_links`) | `--group` / `group` (`task_groups`) |
+|---|---|---|
+| Answers | "What must complete before this runs?" | "What does this task belong to?" |
+| Gates dispatch | **Yes** — child waits in `todo` until all parents are `done` | **Never** |
+| Context handoff | Yes — parent's result rides into the child's worker context | No |
+| Reopen invalidation | Yes — reopening a parent demotes its descendants | No |
+| Notify/tenant inheritance | Yes | No |
+
+The two axes coexist independently: a task may have a parent *and* a group, and
+never the other way around. `unlink` removes a dependency without touching group
+membership, and `group remove` removes a membership without touching
+dependencies. Grouping is metadata, **never** a gate — a member of an open group
+is eligible to run exactly as if it had no group.
+
+```bash
+# EPIC card t_epic is open. A RUN belongs to it but must not wait for it.
+hermes kanban create "RUN-001: wire the retry helper" --assignee coder --group t_epic
+# → created in its normal state (ready if unassigned-parents), NOT todo.
+
+# The same RUN that ALSO depends on a finished card:
+hermes kanban create "RUN-002: follow-up" --assignee coder \
+    --parent t_done_card --group t_epic
+# → waits for t_done_card (dependency), grouped under t_epic (containment).
+
+hermes kanban group add    t_epic t_run     # membership is idempotent
+hermes kanban group remove t_epic t_run     # does not touch dependencies
+hermes kanban group list   t_epic           # members with status/assignee
+hermes kanban list --group t_epic           # filter the board by group
+hermes kanban show t_run                     # prints a `groups:` line
+```
+
+Hermes does not enforce the EPIC → LOOP → GENERATION lifecycle — that hierarchy
+is owned by the control plane above the board. Grouping only *represents* it.
+For Generation cards, the execution identity (branch, worktree, sequential RUN
+lease) stays authoritative in the Generation model; see
+`docs/kanban-generation-isolation.md` in the repository. A Generation card may be
+used as a group label, but `task_groups` does not replace the `generation_tasks`
+binding.
 
 ## Handing context to follow-up cards (the parent link)
 
