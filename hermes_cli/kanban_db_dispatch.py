@@ -1562,8 +1562,12 @@ def _dispatch_lane_task(
     if claimed is None:
         return False
     try:
+        from hermes_cli.kanban_generation import dispatch_workspace
         resolved_branch_name = None
-        if claimed.workspace_kind == "worktree":
+        generation_workspace = dispatch_workspace(conn, claimed)
+        if generation_workspace is not None:
+            workspace, resolved_branch_name = generation_workspace
+        elif claimed.workspace_kind == "worktree":
             workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
@@ -1587,6 +1591,8 @@ def _dispatch_lane_task(
             spawn_fn if spawn_fn is not None else _default_spawn
         )
         pid = _call_spawn_fn(selected_spawn, claimed, str(workspace), board)
+        from hermes_cli.kanban_generation import record_spawn
+        record_spawn(conn, claimed.current_run_id, pid)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
@@ -2266,7 +2272,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
+    from hermes_cli.kanban_generation_worker import source_context, review_prefix, worker_environment, review_instruction
+    source = source_context(task, workspace)
+    worker_environment(env, source)
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    if source is not None:
+        cmd[cmd.index("-q") + 1] += review_instruction(source)
+    cmd = review_prefix(source, Path.home()) + cmd
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
@@ -2277,7 +2289,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
+            cwd=workspace if source is not None or os.path.isdir(workspace) else None,
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,

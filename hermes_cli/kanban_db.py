@@ -3163,17 +3163,8 @@ def _reclaim_dangling_run(
         (task_id, *statuses),
     ).fetchone()
     if stale and stale["current_run_id"]:
-        conn.execute(
-            """
-            UPDATE task_runs
-               SET status = 'reclaimed', outcome = 'reclaimed',
-                   summary = COALESCE(summary, ?),
-                   ended_at = ?,
-                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
-             WHERE id = ? AND ended_at IS NULL
-            """,
-            (note, now, int(stale["current_run_id"])),
-        )
+        _runs._end_run(conn, task_id, outcome="reclaimed", summary=note)
+
 
 
 def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str:

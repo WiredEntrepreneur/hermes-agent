@@ -192,6 +192,11 @@ def reclaim_worktrees(
             continue
 
         entry = Path(record.path)
+        from hermes_cli.kanban_generation import is_generation_worktree
+        if is_generation_worktree(record.path):
+            actions.append(f"preserved Generation worktree {record.name}")
+            continue
+
         if record.untracked:
             archive = _archive_untracked(entry, record.untracked)
             if archive is None:

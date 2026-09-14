@@ -116,6 +116,9 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     so cleanup never blocks completion. ``scratch`` is removed; ``worktree``
     only when provably free of work (clean tree, every commit reachable from a
     remote-tracking ref); ``dir`` is intentionally preserved."""
+    from hermes_cli.kanban_generation import task_generation
+    if task_generation(conn, task_id) is not None:
+        return  # Generation lifetime exceeds every individual RUN/task.
     try:
         row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
         if not row:
@@ -185,6 +188,9 @@ def _cleanup_worktree_workspace(
         return  # CLI safety predicates unavailable — preserve
     try:
         wp = Path(path).expanduser()
+        from hermes_cli.kanban_generation import is_generation_worktree
+        if is_generation_worktree(wp):
+            return  # Also protect against an unrelated legacy task aliasing this path.
         if not wp.is_dir():
             return
         common = _git_common_dir(wp)
@@ -413,6 +419,8 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
 
 def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
     """Materialize the canonical ``<repo>/.worktrees/<task-id>`` worktree."""
+    from hermes_cli.kanban_generation import reject_unbound_source
+    reject_unbound_source(repo_root)
     target = repo_root / ".worktrees" / task_id
     _ensure_git_worktree(repo_root, target, branch_name)
     return target, branch_name
@@ -424,6 +432,9 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
     instead of the dispatcher's incidental CWD (whatever dir the gateway was
     launched from); with no anchor configured we fail loudly rather than guess."""
+    from hermes_cli.kanban_generation import reject_unbound_source
+    if task.workspace_path:
+        reject_unbound_source(task.workspace_path)
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
@@ -527,6 +538,8 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
             )
     else:
         raise ValueError(f"unknown workspace_kind: {kind}")
+    from hermes_cli.kanban_generation import reject_unbound_source
+    reject_unbound_source(p)
     p.mkdir(parents=True, exist_ok=True)
     return p
 

@@ -26,6 +26,7 @@ class AntigravityAdapter:
     provider = "gemini"
     sandbox_enabled = True
     output_format = "json"
+    command_prefix = ()
 
     def __init__(
         self,
@@ -84,7 +85,7 @@ class AntigravityAdapter:
         try:
             project_id, project_path = self._write_bounded_project(workspace, child_env)
             completed = subprocess.run(
-                self.build_argv(prompt, project_id), cwd=workspace, env=child_env,
+                [*self.command_prefix, *self.build_argv(prompt, project_id)], cwd=workspace, env=child_env,
                 capture_output=True, text=True, timeout=self.timeout_seconds, shell=False,
             )
         except subprocess.TimeoutExpired as exc:

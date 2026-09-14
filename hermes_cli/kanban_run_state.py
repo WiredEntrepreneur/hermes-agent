@@ -17,6 +17,8 @@ def _end_run(
     run_id = kb._current_run_id(conn, task_id)
     if run_id is None:
         return None
+    from hermes_cli.kanban_generation import finish_run
+    finish_run(conn, run_id, status or outcome)
     conn.execute(
         """
         UPDATE task_runs
@@ -46,6 +48,10 @@ def _claim_and_open_run(
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
     when the CAS lost. Caller holds the txn."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_generation import prepare_run, open_run
+    prepared = prepare_run(conn, task_id, source_status)
+    if prepared is False:
+        return None
     cur = conn.execute(
         f"""
         UPDATE tasks
@@ -79,6 +85,7 @@ def _claim_and_open_run(
         ),
     )
     run_id = run_cur.lastrowid
+    open_run(conn, run_id, prepared)
     conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
     kb._append_event(
         conn, task_id, "claimed",
