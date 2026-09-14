@@ -196,7 +196,11 @@ class TestThinkingOnlyTruncation:
             ),
             _full_response("finally complete."),
         ]
-        _run(loop_agent, "write me a long report")
+        # Two truncations before success needs a bound > 1; the default (1) is
+        # exercised by the ceiling/regression tests. This test is about the
+        # reasoning-off flag lifecycle across multiple continuations.
+        with patch("agent.turn_truncation.MAX_LENGTH_CONTINUATIONS", 2):
+            _run(loop_agent, "write me a long report")
 
         calls = loop_agent.client.chat.completions.create.call_args_list
         assert len(calls) == 3
@@ -206,9 +210,11 @@ class TestThinkingOnlyTruncation:
         assert loop_agent._ephemeral_reasoning_off is False
 
     def test_full_ceiling_with_empty_fragments_still_settles(self, loop_agent):
-        """All four attempts thinking-only: the turn must exit through the
-        ceiling with an actionable final_response, no poisoned transcript,
-        and no leaked reasoning-off flag."""
+        """Every attempt thinking-only: the turn must exit through the ceiling
+        with an actionable final_response, no poisoned transcript, and no leaked
+        reasoning-off flag. With the default bound (1 automatic continuation)
+        this is the original request plus one continuation = two provider calls.
+        """
         loop_agent.client.chat.completions.create.side_effect = [
             _thinking_only_length_response() for _ in range(4)
         ]
@@ -216,7 +222,9 @@ class TestThinkingOnlyTruncation:
 
         assert result["completed"] is False
         assert result["partial"] is True
-        assert "truncated after 4 continuation attempts" in (result.get("error") or "")
+        assert "OUTPUT_BUDGET_EXCEEDED" in (result.get("error") or "")
+        # Bounded: one original request + exactly one automatic continuation.
+        assert len(loop_agent.client.chat.completions.create.call_args_list) == 2
         assert result["final_response"], (
             "An all-empty ceiling exit must still surface a user-facing "
             "message instead of an invisible None."
@@ -236,7 +244,10 @@ class TestThinkingOnlyTruncation:
             _thinking_only_length_response(),
             _full_response("and the ending."),
         ]
-        result = _run(loop_agent, "write me a long report")
+        # Two continuations before success needs a bound > 1; this test is about
+        # fragment stitching (visible kept, empty skipped) across continuations.
+        with patch("agent.turn_truncation.MAX_LENGTH_CONTINUATIONS", 2):
+            result = _run(loop_agent, "write me a long report")
 
         assert result["completed"] is True
         assert "visible part one." in (result["final_response"] or "")
@@ -285,7 +296,11 @@ class TestReasoningOffReachesTheWire:
             _truncated_text_response("PART ONE of the answer"),
             _full_response(" and PART TWO, done."),
         ]
-        result = _run(loop_agent, "write me a long report")
+        # Two continuations before success needs a bound > 1; this test is about
+        # the reasoning-off request landing exactly once and the prefix staying
+        # byte-stable across the continuation sequence.
+        with patch("agent.turn_truncation.MAX_LENGTH_CONTINUATIONS", 2):
+            result = _run(loop_agent, "write me a long report")
         assert result["completed"] is True
         assert "PART ONE" in result["final_response"]
         assert "PART TWO" in result["final_response"]

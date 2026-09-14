@@ -84,11 +84,18 @@ def test_prompt_filling_the_window_ends_the_turn_on_first_truncation(loop_agent)
 
 
 def test_output_cap_truncation_with_headroom_still_continues(loop_agent):
+    # Output-cap truncation WITH headroom continues (unlike the window-filled case
+    # above, which stops on the first truncation) — but the continuation is bounded
+    # to MAX_LENGTH_CONTINUATIONS (default 1): one original request + one continuation,
+    # then a deterministic OUTPUT_BUDGET_EXCEEDED terminal. This is the HERMES-FIX-002
+    # bound that prevents an oversized deliverable from fanning into many provider calls.
     loop_agent.client.chat.completions.create.side_effect = [
         _length_response(f"part {i} ", prompt_tokens=4_000 + 500 * i) for i in range(4)
     ]
     result = _run(loop_agent, "write me a long report")
 
-    assert loop_agent.client.chat.completions.create.call_count == 4
-    assert "truncated after 4 continuation attempts" in (result.get("error") or "")
-    assert "part 3" in result["final_response"]
+    assert loop_agent.client.chat.completions.create.call_count == 2
+    assert "OUTPUT_BUDGET_EXCEEDED" in (result.get("error") or "")
+    # Both received fragments are stitched into the partial answer.
+    assert "part 0" in result["final_response"]
+    assert "part 1" in result["final_response"]

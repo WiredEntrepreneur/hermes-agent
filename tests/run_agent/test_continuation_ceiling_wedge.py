@@ -1,9 +1,9 @@
 """Regression tests for the post-ceiling session wedge.
 
-A turn that exhausts all 4 length-continuation attempts must leave the
-session usable: the next user message issues a fresh upstream request,
-inherits no continuation counter, and the partial text that WAS received
-is surfaced instead of dropped.
+A turn that exhausts its length-continuation budget (network-stream stubs keep
+the legacy 4-attempt budget) must leave the session usable: the next user message
+issues a fresh upstream request, inherits no continuation counter, and the partial
+text that WAS received is surfaced instead of dropped.
 """
 
 from __future__ import annotations
@@ -83,8 +83,10 @@ class TestContinuationCeilingWedge:
         from tests.run_agent.test_run_agent import _mock_response
 
         result1 = self._exhaust_ceiling(loop_agent)
-        assert "truncated after 4 continuation attempts" in (result1.get("error") or "")
+        assert "OUTPUT_BUDGET_EXCEEDED" in (result1.get("error") or "")
         calls_after_turn1 = loop_agent.client.chat.completions.create.call_count
+        # Network-stream stubs keep the legacy continuation budget (4 calls); only
+        # genuine output-cap truncation is bounded to 1 continuation.
         assert calls_after_turn1 == 4
 
         loop_agent.client.chat.completions.create.side_effect = [
@@ -200,7 +202,7 @@ class TestContinuationCeilingWedge:
         ]
         result = _run(loop_agent, "another long report", history=reloaded_history)
 
-        assert "truncated after 4 continuation attempts" in (result.get("error") or "")
+        assert "OUTPUT_BUDGET_EXCEEDED" in (result.get("error") or "")
         prior = [
             m for m in result["messages"]
             if m.get("role") == "assistant"
@@ -213,7 +215,7 @@ class TestContinuationCeilingWedge:
 
     def test_new_turn_does_not_inherit_continuation_counter(self, loop_agent):
         """A single truncation on the turn AFTER the ceiling must get its
-        own full 4-attempt budget, not the exhausted counter."""
+        own fresh continuation budget, not the exhausted counter."""
         from tests.run_agent.test_run_agent import _mock_response
 
         result1 = self._exhaust_ceiling(loop_agent)
@@ -224,7 +226,7 @@ class TestContinuationCeilingWedge:
         result2 = _run(loop_agent, "try again", history=result1["messages"])
 
         assert result2["completed"] is True, (
-            "One truncation on a fresh turn must continue (1/4), not fail "
+            "One truncation on a fresh turn must continue, not fail "
             "with an inherited exhausted counter."
         )
         assert "second turn partial" in result2["final_response"]

@@ -1,10 +1,11 @@
 """Truncation recovery (``finish_reason == "length"``) for the conversation turn loop.
 
 Handles thinking-budget exhaustion, repetition-dominated truncation, content-filter stream
-stalls escalated to the fallback chain, text continuation nudges (up to 4, with the ceiling
-exit that drops the fragment trail), truncated tool-call retries with max_tokens boosts, and
-the final roll-back. Nothing here imports ``agent.conversation_loop`` at module level
-(cycle); loop-internal helpers are imported lazily so tests patching them keep working.
+stalls escalated to the fallback chain, text continuation nudges (bounded — see
+``MAX_LENGTH_CONTINUATIONS``, with the ceiling exit that drops the fragment trail), truncated
+tool-call retries with max_tokens boosts, and the final roll-back. Nothing here imports
+``agent.conversation_loop`` at module level (cycle); loop-internal helpers are imported lazily
+so tests patching them keep working.
 """
 
 from __future__ import annotations
@@ -24,6 +25,28 @@ from agent.usage_pricing import normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 
 logger = logging.getLogger("agent.conversation_loop")
+
+# HERMES-FIX-002: a provider output cap (finish_reason="length" from hitting max output
+# tokens) is NOT successful completion and is NOT a licence to regenerate the whole answer
+# indefinitely — the runtime, not the model, owns continuation policy. A genuine output-cap
+# truncation therefore gets at most MAX_LENGTH_CONTINUATIONS automatic continuations (default
+# 1) before the turn ends deterministically with an OUTPUT_BUDGET_EXCEEDED-class partial
+# result. This bounds the amplification loop (generate oversized payload -> length ->
+# regenerate from the beginning -> length -> ...) that could otherwise fan a single deliverable
+# into many provider calls while each resends a growing prompt into the same cap.
+#
+# Network-stream stubs (PARTIAL_STREAM_STUB_ID — the stream dropped mid-delivery, NOT the
+# output cap) are transient and keep the legacy retry budgets: retrying a dropped stream does
+# not resend a larger prompt and often succeeds. The counters (``length_continue_retries`` /
+# ``truncated_tool_call_retries``) live on the per-turn ``_LoopState`` in
+# agent/conversation_loop.py, so they reset at the turn boundary — they accumulate within a
+# turn (so the bound cannot be defeated) but never leak across independent user turns/tasks.
+# Tests exercising the multi-continuation logic (reasoning-off restoration, fragment
+# stitching) patch MAX_LENGTH_CONTINUATIONS higher rather than depending on the default.
+MAX_LENGTH_CONTINUATIONS = 1
+_NETWORK_STUB_TEXT_CONTINUATIONS = 3  # legacy text-nudge budget for dropped streams
+_NETWORK_STUB_TOOL_RETRIES = 4  # legacy tool-call retry budget for dropped streams
+_OUTPUT_BUDGET_EXCEEDED = "OUTPUT_BUDGET_EXCEEDED"
 
 _CONTINUABLE_MODES = {"chat_completions", "bedrock_converse", "anthropic_messages"}
 _THINK_TAG_RE = re.compile(r'<(?:think|thinking|reasoning|REASONING_SCRATCHPAD)[^>]*>', re.IGNORECASE)
@@ -254,17 +277,21 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
         st.truncated_response_parts.append(_interim_content)
 
     filled = st.window_filled
-    if n < 4 and filled is None:
+    # Genuine output-cap truncation is bounded to MAX_LENGTH_CONTINUATIONS (default 1);
+    # transient network-stream stubs keep the legacy nudge budget (they are not the
+    # oversized-payload amplification vector). See the module-level HERMES-FIX-002 note.
+    _bound = _NETWORK_STUB_TEXT_CONTINUATIONS if st.is_stub else MAX_LENGTH_CONTINUATIONS
+    if n <= _bound and filled is None:
         _dropped_tools = getattr(st.response, "_dropped_tool_names", None)
         if st.is_stub and _dropped_tools:
             agent._vprint(
                 f"{agent.log_prefix}↻ Stream interrupted mid "
-                f"tool-call ({', '.join(_dropped_tools[:3])}) — requesting chunked retry ({n}/4)..."
+                f"tool-call ({', '.join(_dropped_tools[:3])}) — requesting chunked retry ({n}/{_bound})..."
             )
         elif st.is_stub:
-            agent._vprint(f"{agent.log_prefix}↻ Stream interrupted — requesting continuation ({n}/4)...")
+            agent._vprint(f"{agent.log_prefix}↻ Stream interrupted — requesting continuation ({n}/{_bound})...")
         else:
-            agent._vprint(f"{agent.log_prefix}↻ Requesting continuation ({n}/4)...")
+            agent._vprint(f"{agent.log_prefix}↻ Requesting continuation ({n}/{_bound})...")
         append_message(messages, {
             "role": "user", "content": _get_continuation_prompt(st.is_stub, _dropped_tools),
             "_length_continuation_nudge": True,
@@ -279,7 +306,8 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
     agent._vprint(
         f"{agent.log_prefix}⚠️  Not continuing — each attempt would only grow the prompt."
         if filled is not None else
-        f"{agent.log_prefix}⚠️  Response still truncated after {n} continuation attempts — "
+        f"{agent.log_prefix}⚠️  Output budget exceeded — response still truncated after "
+        f"{n - 1} automatic continuation attempt(s); "
         + ("keeping the partial response received so far." if partial_response
            else "no visible text was produced."),
         force=True,
@@ -306,7 +334,8 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
         )
     return st.end_turn(
         partial_response or _CEILING_NO_TEXT,
-        "Response remained truncated after 4 continuation attempts",
+        f"{_OUTPUT_BUDGET_EXCEEDED}: response remained truncated after {n - 1} "
+        "automatic continuation attempt(s)",
     )
 
 
@@ -315,13 +344,19 @@ def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict
     a real output-cap truncation needs it, harmless for a network stall — else refuse to
     execute incomplete arguments."""
     agent = st.agent
-    if st.truncated_tool_call_retries < 4:
+    # Output-cap truncation of tool arguments is the oversized-write_file amplification
+    # vector: re-running the SAME enormous call with a boosted max_tokens only resends a
+    # growing prompt into the same cap. Bound it to MAX_LENGTH_CONTINUATIONS (default 1);
+    # transient network-stream stubs keep the legacy retry budget (a dropped stream is worth
+    # re-issuing). See the module-level HERMES-FIX-002 note.
+    _tc_bound = _NETWORK_STUB_TOOL_RETRIES if st.is_stub else MAX_LENGTH_CONTINUATIONS
+    if st.truncated_tool_call_retries < _tc_bound:
         st.truncated_tool_call_retries += 1
         n = st.truncated_tool_call_retries
         if st.is_stub:
-            agent._buffer_vprint(f"⚠️  Stream interrupted mid tool-call — retrying ({n}/4)...")
+            agent._buffer_vprint(f"⚠️  Stream interrupted mid tool-call — retrying ({n}/{_tc_bound})...")
         else:
-            agent._buffer_vprint(f"⚠️  Truncated tool call detected — retrying API call ({n}/4)...")
+            agent._buffer_vprint(f"⚠️  Truncated tool call detected — retrying API call ({n}/{_tc_bound})...")
         _tc_boost = (agent.max_tokens if agent.max_tokens else 4096) * (2 ** n)
         _tc_requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
         if _tc_requested_cap is not None:
@@ -331,20 +366,25 @@ def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict
     agent._flush_status_buffer()
     if st.is_stub:
         agent._vprint(
-            f"{agent.log_prefix}⚠️  Stream kept dropping mid tool-call after 4 retries — the action was not executed.",
+            f"{agent.log_prefix}⚠️  Stream kept dropping mid tool-call after {_tc_bound} "
+            "retries — the action was not executed.",
             force=True,
         )
         _final_response = "Stream repeatedly dropped mid tool-call (network); the tool was not executed"
+        _tc_error = None  # error defaults to _final_response
     else:
         agent._vprint(
-            f"{agent.log_prefix}⚠️  Truncated tool call response detected again — refusing to execute incomplete tool arguments.",
+            f"{agent.log_prefix}⚠️  Truncated tool call response detected again — refusing to "
+            "execute incomplete tool arguments (output budget exceeded).",
             force=True,
         )
         _final_response = _TRUNCATED_FINAL
+        # Fail-closed: incomplete/truncated tool arguments are never stitched or executed.
+        _tc_error = f"{_OUTPUT_BUDGET_EXCEEDED}: tool-call arguments truncated by the output cap"
     agent._cleanup_task_resources(st.effective_task_id)
     # Prior tool batches can leave a tool-result tail; this path never reaches finalize_turn.
     close_interrupted_tool_sequence(st.messages, _final_response)
-    return st.end_turn(_final_response, cleanup=False)
+    return st.end_turn(_final_response, error=_tc_error, cleanup=False)
 
 
 def recover_from_truncation(
