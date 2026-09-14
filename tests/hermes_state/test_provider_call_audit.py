@@ -62,3 +62,38 @@ def test_length_response_is_persisted_before_truncation_handling_without_hooks_o
     assert rows[0]["input_tokens"] == 50 and rows[0]["output_tokens"] == 8
     assert rows[0]["finish_reason"] == "length" and rows[0]["truncated"] == 1
     assert rows[0]["task_run_id"] == "41" and rows[0]["provider_response_id"] == "chatcmpl-local"
+
+
+def test_usage_normalization_failure_keeps_identity_audit_fail_soft(tmp_path, monkeypatch, caplog):
+    from agent import turn_response_check
+
+    def normalization_failure(*args, **kwargs):
+        raise ValueError("unusual provider usage")
+
+    monkeypatch.setattr(turn_response_check, "normalize_usage", normalization_failure)
+    db = SessionDB(tmp_path / "state.db")
+    agent = SimpleNamespace(
+        _session_db=db, _session_db_created=False, session_id="fail-soft",
+        provider="openrouter", model="requested/model", api_mode="chat_completions",
+        agent_identity="worker", _ensure_db_session=lambda: None,
+    )
+    response = SimpleNamespace(
+        id="response-1", model="returned/model", provider="upstream",
+        usage=SimpleNamespace(provider_specific="malformed"),
+    )
+    try:
+        turn_response_check._persist_provider_call(
+            agent, response, finish_reason="stop", api_request_id="turn-y:api:1",
+            effective_task_id="task-y", turn_id="turn-y", api_start_time=30.0, api_duration=1.0,
+        )
+        rows = db.provider_calls("fail-soft")
+    finally:
+        db.close()
+
+    assert "Provider-call usage normalization failed" in caplog.text
+    assert len(rows) == 1
+    assert rows[0]["configured_model"] == "requested/model"
+    assert rows[0]["response_model"] == "returned/model" and rows[0]["finish_reason"] == "stop"
+    assert all(rows[0][column] is None for column in (
+        "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens",
+    ))

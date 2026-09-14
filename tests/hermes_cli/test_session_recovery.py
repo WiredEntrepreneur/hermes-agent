@@ -667,6 +667,35 @@ def _insert_delivery_obligations(path: Path, rows: list[tuple[object, ...]]) -> 
         conn.close()
 
 
+def test_recovery_copies_provider_call_audit_rows(tmp_path: Path) -> None:
+    source = tmp_path / "state.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    db = SessionDB(source)
+    try:
+        db.record_provider_call(
+            "turn-1:api:1", "recovery-session-0", turn_id="turn-1",
+            configured_provider="openrouter", configured_model="requested/model",
+            response_model="returned/model", finish_reason="length", truncated=True,
+            started_at=10.0, completed_at=11.0,
+        )
+    finally:
+        db.close()
+
+    report = recover_session_database(source, output, work_dir=tmp_path)
+
+    assert report["copy"]["provider_calls"]["status"] == "complete"
+    assert report["verification"]["table_counts"]["provider_calls"] == 1
+    recovered = SessionDB(output)
+    try:
+        rows = recovered.provider_calls("recovery-session-0")
+    finally:
+        recovered.close()
+    assert rows[0]["configured_model"] == "requested/model"
+    assert rows[0]["response_model"] == "returned/model"
+    assert rows[0]["finish_reason"] == "length" and rows[0]["truncated"] == 1
+
+
 def test_recovery_copies_delivery_obligations(tmp_path: Path) -> None:
     """Owed replies must survive salvage — #100313 lost 6 obligation rows."""
 

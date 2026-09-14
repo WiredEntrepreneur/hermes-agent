@@ -90,8 +90,15 @@ def _persist_provider_call(
     """Durably audit a valid provider response before any retry/continuation branch."""
     if not agent._session_db or not agent.session_id:
         return
-    raw_usage = getattr(response, "usage", None)
-    usage = normalize_usage(raw_usage, provider=agent.provider, api_mode=agent.api_mode) if raw_usage else None
+    try:
+        raw_usage = getattr(response, "usage", None)
+        usage = normalize_usage(raw_usage, provider=agent.provider, api_mode=agent.api_mode) if raw_usage else None
+    except Exception:
+        usage = None
+        logger.warning(
+            "Provider-call usage normalization failed (session=%s call=%s)",
+            agent.session_id, api_request_id, exc_info=True,
+        )
     try:
         if not agent._session_db_created:
             agent._ensure_db_session()
