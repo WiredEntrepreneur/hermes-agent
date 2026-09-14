@@ -72,6 +72,7 @@ ownership for a redelivered event.
 ├── sessions              — Session metadata, token counts, billing
 ├── messages              — Full message history per session
 ├── session_model_usage   — Per-model/per-task usage attribution rows
+├── provider_calls        — Per-call requested/returned model identity and outcome audit
 ├── messages_fts          — FTS5 virtual table (content + tool_name + tool_calls)
 ├── messages_fts_trigram  — FTS5 virtual table with trigram tokenizer (CJK / substring search)
 ├── messages_fts_cjk      — FTS5 virtual table with cjk_unicode61 tokenizer
@@ -82,6 +83,13 @@ ownership for a redelivered event.
 ├── delivery_obligations  — Gateway outbox (owed replies); created lazily by gateway/delivery_ledger.py
 └── schema_version        — Single-row table tracking migration state
 ```
+
+`provider_calls` is the local audit trail for completed provider responses. Its
+`configured_provider` / `configured_model` columns describe the requested route;
+`response_provider` / `response_model` contain only identities independently returned by
+the provider. Providers that omit identity or usage leave those fields `NULL`. Operators
+and qualification tooling can inspect the table in `state.db`, correlating calls through
+`provider_call_id`, `turn_id`, `task_id`, and (for Kanban workers) `task_run_id`.
 
 `hermes sessions recover` copies the row-bearing tables above into the
 recovered database (FTS indexes and `schema_version` are regenerated), including

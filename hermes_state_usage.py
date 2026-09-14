@@ -82,6 +82,48 @@ _MODEL_USAGE_FIELDS = frozenset((
 class SessionUsageMixin:
     """Coalesced token writer, per-model usage rows, billing route."""
 
+    def record_provider_call(
+        self, provider_call_id: str, session_id: str, *, turn_id: str,
+        task_id: Optional[str]=None, task_run_id: Optional[str]=None,
+        worker_identity: Optional[str]=None, configured_provider: Optional[str]=None,
+        configured_model: Optional[str]=None, response_provider: Optional[str]=None,
+        response_model: Optional[str]=None, input_tokens: Optional[int]=None,
+        output_tokens: Optional[int]=None, cache_read_tokens: Optional[int]=None,
+        cache_write_tokens: Optional[int]=None, reasoning_tokens: Optional[int]=None,
+        finish_reason: Optional[str]=None, truncated: bool=False,
+        provider_response_id: Optional[str]=None, started_at: Optional[float]=None,
+        completed_at: Optional[float]=None,
+    ) -> None:
+        """Persist one provider response without conflating requested and returned identity."""
+        if not provider_call_id or not session_id or not turn_id:
+            raise ValueError("provider_call_id, session_id, and turn_id are required")
+        self._insert_session_row(session_id, "unknown", model=configured_model)
+        ended = time.time() if completed_at is None else float(completed_at)
+        began = ended if started_at is None else float(started_at)
+        self._execute_write(lambda conn: conn.execute(
+            """INSERT INTO provider_calls (
+                   provider_call_id, session_id, turn_id, task_id, task_run_id,
+                   worker_identity, configured_provider, configured_model,
+                   response_provider, response_model, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                   finish_reason, truncated, provider_response_id, started_at, completed_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (provider_call_id, session_id, turn_id, task_id, task_run_id,
+             worker_identity, configured_provider, configured_model,
+             response_provider, response_model, input_tokens, output_tokens,
+             cache_read_tokens, cache_write_tokens, reasoning_tokens,
+             finish_reason, int(bool(truncated)), provider_response_id, began, ended),
+        ))
+
+    def provider_calls(self, session_id: str) -> List[Dict[str, Any]]:
+        """Return a session's provider-call audit records in completion order."""
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT * FROM provider_calls WHERE session_id = ? ORDER BY completed_at, provider_call_id",
+                (session_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def update_session_billing_route(
         self, session_id: str, *, provider: str, base_url: str, billing_mode: Optional[str] = None,
     ) -> None:
