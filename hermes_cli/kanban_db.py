@@ -11,6 +11,8 @@ locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attach
 
 from __future__ import annotations
 
+from hermes_cli import kanban_run_state as _runs
+
 import contextlib
 import json
 import os
@@ -1852,37 +1854,6 @@ def _append_event(
     )
 
 
-def _end_run(
-    conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
-    error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
-) -> Optional[int]:
-    """Close the active run (``status`` defaults to ``outcome``) and clear
-    ``current_run_id``; None when no run was active (never-claimed task)."""
-    now = int(time.time())
-    run_id = _current_run_id(conn, task_id)
-    if run_id is None:
-        return None
-    conn.execute(
-        """
-        UPDATE task_runs
-           SET status        = ?,
-               outcome       = ?,
-               summary       = ?,
-               error         = ?,
-               metadata      = ?,
-               ended_at      = ?,
-               claim_lock    = NULL,
-               claim_expires = NULL,
-               worker_pid    = NULL
-         WHERE id = ?
-           AND ended_at IS NULL
-        """,
-        (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
-    )
-    conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
-    return run_id
-
-
 def _first_line(text: Optional[str], limit: int) -> str:
     """First non-blank-stripped line of ``text`` capped at ``limit`` chars; "" when empty."""
     lines = (text or "").strip().splitlines()
@@ -1916,7 +1887,7 @@ def _end_or_synthesize_run(
 ) -> Optional[int]:
     """:func:`_end_run`; when no run was active and ``synthesize`` holds, record a
     zero-duration run instead so the handoff fields survive in attempt history."""
-    run_id = _end_run(conn, task_id, outcome=outcome, status=status, summary=summary, metadata=metadata)
+    run_id = _runs._end_run(conn, task_id, outcome=outcome, status=status, summary=summary, metadata=metadata)
     if run_id is None and synthesize:
         run_id = _synthesize_ended_run(conn, task_id, outcome=outcome, summary=summary, metadata=metadata)
     return run_id
@@ -2080,53 +2051,6 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
-def _claim_and_open_run(
-    conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
-    *, event_extra: Optional[dict] = None,
-) -> Optional[int]:
-    """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
-    when the CAS lost. Caller holds the txn."""
-    cur = conn.execute(
-        f"""
-        UPDATE tasks
-           SET status        = 'running',
-               claim_lock    = ?,
-               claim_expires = ?,
-               started_at    = COALESCE(started_at, ?)
-         WHERE id = ?
-           AND status = '{source_status}'
-           AND claim_lock IS NULL
-        """,
-        (lock, expires, now, task_id),
-    )
-    if cur.rowcount != 1:
-        return None
-    trow = conn.execute(
-        "SELECT assignee, max_runtime_seconds, current_step_key "
-        "FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    run_cur = conn.execute(
-        """
-        INSERT INTO task_runs (
-            task_id, profile, step_key, status,
-            claim_lock, claim_expires, max_runtime_seconds,
-            started_at
-        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
-        """,
-        (
-            task_id, trow["assignee"] if trow else None, trow["current_step_key"] if trow else None,
-            lock, expires, trow["max_runtime_seconds"] if trow else None, now,
-        ),
-    )
-    run_id = run_cur.lastrowid
-    conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
-    _append_event(
-        conn, task_id, "claimed",
-        {"lock": lock, "expires": expires, "run_id": run_id, **(event_extra or {})}, run_id=run_id,
-    )
-    return run_id
-
-
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
@@ -2154,7 +2078,7 @@ def claim_task(
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
+        run_id = _runs._claim_and_open_run(conn, task_id, "ready", lock, expires, now)
         if run_id is None:
             return None
         claimed = get_task(conn, task_id)
@@ -2184,7 +2108,7 @@ def claim_review_task(
                     {"reason": "parent_reopened", "source_status": "review"},
                 )
             return None
-        run_id = _claim_and_open_run(
+        run_id = _runs._claim_and_open_run(
             conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},
         )
         if run_id is None:
@@ -2365,7 +2289,7 @@ def _record_reclaim(
 ) -> Optional[int]:
     """Close the active run as ``reclaimed`` and emit the ``reclaimed`` event
     (payload merged with the termination report). Caller holds the txn."""
-    run_id = _end_run(
+    run_id = _runs._end_run(
         conn, task_id, outcome="reclaimed", status="reclaimed", error=error, metadata=termination,
     )
     payload.update(termination)
@@ -2584,7 +2508,7 @@ def complete_task(
             return False
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
-        run_id = _end_run(
+        run_id = _runs._end_run(
             conn, task_id, outcome="completed", status="done", summary=handoff_summary,
             metadata=metadata,
         )
@@ -3161,7 +3085,7 @@ def request_changes(
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
-        run_id = _end_run(
+        run_id = _runs._end_run(
             conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
         )
         _append_event(
@@ -3389,7 +3313,7 @@ def invalidate_descendants_for_parent_reopen(
             elif previous_status == "running":
                 resume_status = _retry_status_for_run(conn, row["id"], row["current_run_id"])
                 terminations.append((row["worker_pid"], row["claim_lock"]))
-                run_id = _end_run(
+                run_id = _runs._end_run(
                     conn, row["id"], outcome="reclaimed", status="todo",
                     summary=f"ancestor {task_id} reopened",
                 )
@@ -3500,7 +3424,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if cur.rowcount != 1:
             return False
         # Archived mid-run (dashboard): close the run so history isn't orphaned.
-        run_id = _end_run(
+        run_id = _runs._end_run(
             conn, task_id, outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )

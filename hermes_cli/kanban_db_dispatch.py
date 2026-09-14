@@ -7,6 +7,8 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 
 from __future__ import annotations
 
+from hermes_cli import kanban_run_state as _runs
+
 import contextlib
 import os
 import re
@@ -480,7 +482,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
-                run_id = _kb._end_run(
+                run_id = _runs._end_run(
                     conn, tid, outcome="timed_out", status="timed_out",
                     error=error, metadata=payload,
                 )
@@ -586,7 +588,7 @@ def detect_stale_running(
             }
             payload.update(termination)
 
-            run_id = _kb._end_run(
+            run_id = _runs._end_run(
                 conn, tid,
                 outcome="stale", status="stale",
                 error=(
@@ -647,7 +649,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
                 "worker_pid": int(pid) if pid else None,
                 "now": now,
             }
-            run_id = _kb._end_run(
+            run_id = _runs._end_run(
                 conn, tid,
                 outcome="reclaimed", status="reclaimed",
                 error="orphaned running card (broken claim bookkeeping)",
@@ -837,7 +839,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
             )
             if cur.rowcount != 1:
                 continue
-            run_id = _kb._end_run(
+            run_id = _runs._end_run(
                 conn, row["id"],
                 outcome=dead.run_outcome, status=dead.run_outcome,
                 error=dead.error_text,
@@ -1049,7 +1051,7 @@ def _record_task_failure(
                 )
             # Timeout/crash path's caller already emitted its own event.
             if end_run:
-                run_id = _kb._end_run(
+                run_id = _runs._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error,
                     metadata={"failures": failures, "retry_status": retry_status},
                 )
@@ -1081,7 +1083,7 @@ def _record_task_failure(
         run_id = None
         if end_run:
             # Only the spawn path has an open run to close.
-            run_id = _kb._end_run(
+            run_id = _runs._end_run(
                 conn, task_id, outcome="gave_up", status="gave_up", error=error,
                 metadata={
                     "failures": failures,
