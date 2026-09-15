@@ -23,8 +23,8 @@ from hermes_state_repair import _db_opens_cleanly
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 _CANONICAL_TABLES = (
-    "system_prompts", "sessions", "messages", "session_model_usage", "compression_locks", "gateway_routing",
-    "async_delegations",
+    "system_prompts", "sessions", "messages", "session_model_usage", "provider_calls",
+    "compression_locks", "gateway_routing", "async_delegations",
 )
 _TOPIC_TABLES = ("telegram_dm_topic_mode", "telegram_dm_topic_bindings")
 
@@ -740,7 +740,9 @@ def _reconcile(destination: sqlite3.Connection, table: str, where: str, mutation
     return count
 
 
-_DEPENDENT_TABLES = ("messages", "session_model_usage", "compression_locks", "telegram_dm_topic_bindings")
+_DEPENDENT_TABLES = (
+    "messages", "session_model_usage", "provider_calls", "compression_locks", "telegram_dm_topic_bindings",
+)
 _RELINK_COUNTERS = ("session_prompt_refs_cleared", "sessions_parent_cleared")
 
 

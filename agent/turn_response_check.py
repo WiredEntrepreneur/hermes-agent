@@ -10,12 +10,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import os
 import time
 from typing import Any, Dict, Optional
 
 from agent.turn_api_call import stop_thinking_spinner
 from agent.turn_truncation import handle_content_policy_refusal, recover_from_truncation
 from agent.turn_usage import record_response_usage
+from agent.usage_pricing import normalize_usage
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -81,6 +83,50 @@ def _derive_finish_reason(agent: Any, response: Any, messages: Any) -> str:
     return finish_reason
 
 
+def _persist_provider_call(
+    agent: Any, response: Any, *, finish_reason: Any, api_request_id: Any,
+    effective_task_id: Any, turn_id: Any, api_start_time: float, api_duration: float,
+) -> None:
+    """Durably audit a valid provider response before any retry/continuation branch."""
+    if not agent._session_db or not agent.session_id:
+        return
+    try:
+        raw_usage = getattr(response, "usage", None)
+        usage = normalize_usage(raw_usage, provider=agent.provider, api_mode=agent.api_mode) if raw_usage else None
+    except Exception:
+        usage = None
+        logger.warning(
+            "Provider-call usage normalization failed (session=%s call=%s)",
+            agent.session_id, api_request_id, exc_info=True,
+        )
+    try:
+        if not agent._session_db_created:
+            agent._ensure_db_session()
+        agent._session_db.record_provider_call(
+            str(api_request_id), agent.session_id, turn_id=str(turn_id),
+            task_id=str(effective_task_id) if effective_task_id else None,
+            task_run_id=(os.environ.get("HERMES_KANBAN_RUN_ID") or None),
+            worker_identity=(getattr(agent, "agent_identity", None) or None),
+            configured_provider=(agent.provider or None), configured_model=(agent.model or None),
+            response_provider=(getattr(response, "provider", None) or None),
+            response_model=(getattr(response, "model", None) or None),
+            input_tokens=usage.input_tokens if usage else None,
+            output_tokens=usage.output_tokens if usage else None,
+            cache_read_tokens=usage.cache_read_tokens if usage else None,
+            cache_write_tokens=usage.cache_write_tokens if usage else None,
+            reasoning_tokens=usage.reasoning_tokens if usage else None,
+            finish_reason=str(finish_reason) if finish_reason is not None else None,
+            truncated=finish_reason in {"length", "incomplete"},
+            provider_response_id=(getattr(response, "id", None) or None),
+            started_at=api_start_time, completed_at=api_start_time + api_duration,
+        )
+    except Exception:
+        logger.warning(
+            "Provider-call persistence failed (session=%s call=%s)",
+            agent.session_id, api_request_id, exc_info=True,
+        )
+
+
 def check_api_response(
     agent: Any, *, response: Any, _retry: Any, thinking_spinner: Any, messages: Any,
     api_messages: Any, api_kwargs: Any, active_system_prompt: Any, conversation_history: Any,
@@ -141,6 +187,11 @@ def check_api_response(
 
     agent._turn_received_provider_response = True
     finish_reason = _derive_finish_reason(agent, response, messages)
+    _persist_provider_call(
+        agent, response, finish_reason=finish_reason, api_request_id=api_request_id,
+        effective_task_id=effective_task_id, turn_id=turn_id,
+        api_start_time=api_start_time, api_duration=api_duration,
+    )
 
     # HTTP-200 refusals are deterministic: one fallback try, else return the refusal.
     if finish_reason == "content_filter":
