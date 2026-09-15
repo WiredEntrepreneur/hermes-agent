@@ -352,6 +352,8 @@ def get_task(
         task = _require_task(conn, task_id)
         # Drawer returns the FULL summary (cards on /board carry a 200-char preview).
         task_d = _task_dict(task, latest_summary=kanban_db.latest_summary(conn, task_id))
+        from hermes_cli import kanban_db_groups as kanban_db_groups
+        task_d["groups"] = kanban_db_groups.group_ids(conn, task_id)
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
         children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))

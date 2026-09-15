@@ -952,6 +952,17 @@ CREATE TABLE IF NOT EXISTS task_links (
     PRIMARY KEY (parent_id, child_id)
 );
 
+-- Organizational grouping (FIX-006): "what does this task belong to?".
+-- Scheduling-inert by construction: no dispatcher, recompute_ready, claim,
+-- promotion, cycle-detection, or invalidation path reads this table. It is
+-- deliberately NOT a task_links row — a parent link is an execution
+-- dependency, a group membership is a label.
+CREATE TABLE IF NOT EXISTS task_groups (
+    group_id TEXT NOT NULL,
+    task_id  TEXT NOT NULL,
+    PRIMARY KEY (group_id, task_id)
+);
+
 CREATE TABLE IF NOT EXISTS task_comments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id    TEXT NOT NULL,
@@ -1040,6 +1051,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
+CREATE INDEX IF NOT EXISTS idx_groups_task           ON task_groups(task_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
@@ -1225,7 +1237,8 @@ def create_task(
     assignee: Optional[str] = None, created_by: Optional[str] = None,
     workspace_kind: Optional[str] = None, workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
-    parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
+    parents: Iterable[str] = (), groups: Iterable[str] = (), triage: bool = False,
+    idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
@@ -1235,10 +1248,14 @@ def create_task(
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
 ) -> str:
-    """Create a task (optionally under ``parents``); returns its id.
+    """Create a task (optionally under ``parents`` / ``groups``); returns its id.
 
-    Status: ``ready`` unless a parent is not ``done`` (``todo``); ``triage=True``
-    forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
+    ``parents`` are execution dependencies (scheduling gate + context handoff);
+    ``groups`` are organizational containment labels — a task "belongs to" them
+    but never waits on them. Grouping never affects status, dispatch, or the
+    dependency graph. Status: ``ready`` unless a parent is not ``done``
+    (``todo``); ``triage=True`` forces ``triage``; ``initial_status="blocked"``
+    parks it for human ops.
     ``idempotency_key``: an existing non-archived task with the key is returned
     instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
@@ -1286,6 +1303,7 @@ def create_task(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
     parents = tuple(p for p in parents if p)
+    groups = tuple(dict.fromkeys(g for g in groups if g))
     skills_list = _normalize_task_skills(skills)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
@@ -1348,6 +1366,17 @@ def create_task(
                 )
                 for pid in parents:
                     _link(conn, pid, task_id)
+                # Grouping is containment metadata: validate the containers
+                # exist, then record membership. No status, dispatch, or
+                # dependency-graph effect (FIX-006).
+                missing_groups = _missing_task_ids(conn, groups)
+                if missing_groups:
+                    raise ValueError(f"unknown group task(s): {', '.join(missing_groups)}")
+                for gid in groups:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO task_groups (group_id, task_id) VALUES (?, ?)",
+                        (gid, task_id),
+                    )
                 _append_event(
                     conn,
                     task_id,
@@ -1356,6 +1385,7 @@ def create_task(
                         "assignee": assignee,
                         "status": task_status,
                         "parents": list(parents),
+                        "groups": list(groups),
                         "creator_task_id": creator_task_id,
                         "tenant": tenant,
                         "workspace_kind": workspace_kind,
@@ -1471,6 +1501,7 @@ def list_tasks(
     tenant: Optional[str] = None, session_id: Optional[str] = None, include_archived: bool = False,
     limit: Optional[int] = None, order_by: Optional[str] = None,
     workflow_template_id: Optional[str] = None, current_step_key: Optional[str] = None,
+    group_id: Optional[str] = None,
 ) -> list[Task]:
     if status is not None and status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
@@ -1484,6 +1515,10 @@ def list_tasks(
         if val is not None:
             query += f" AND {col} = ?"
             params.append(val)
+    if group_id is not None:
+        # Organizational filter only — never a scheduling condition.
+        query += " AND id IN (SELECT task_id FROM task_groups WHERE group_id = ?)"
+        params.append(group_id)
     if not include_archived and status != "archived":
         query += " AND status != 'archived'"
     if order_by is not None:
@@ -3430,6 +3465,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
+    conn.execute("DELETE FROM task_groups WHERE group_id = ? OR task_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 

@@ -134,6 +134,24 @@ _BOARD_SPECS = [
     )),
 ]
 
+_GROUP_SPECS = [
+    _cmd("add", [
+        _arg("group_id", help="Group (container) task id"),
+        _arg("task_id", help="Task id to add to the group"),
+        _json_flag(),
+    ], help="Record that task_id belongs to group_id (idempotent)"),
+    _cmd("remove", [
+        _arg("group_id", help="Group (container) task id"),
+        _arg("task_id", help="Task id to remove from the group"),
+        _json_flag(),
+    ], help="Remove task_id from group_id (does not touch dependencies)"),
+    _cmd("list", [
+        _arg("group_id", help="Group (container) task id"),
+        _json_flag(),
+    ], help="List the members of a group"),
+]
+
+
 # Top-level ``hermes kanban <action>`` records, in ``--help`` order.
 _SPECS = [
     _cmd("init", help="Create kanban.db if missing (idempotent)"),
@@ -149,7 +167,10 @@ _SPECS = [
         _arg("title", help="Task title"),
         _arg("--body", help="Optional opening post"),
         _arg("--assignee", help="Profile name to assign"),
-        _arg("--parent", action="append", default=[], help="Parent task id (repeatable)"),
+        _arg("--parent", action="append", default=[], help="Parent task id (repeatable; execution dependency — the child waits for it)"),
+        _arg("--group", action="append", default=[],
+             help="Group task id this task belongs to (repeatable; organizational "
+                  "containment only — never a scheduling dependency)"),
         _arg("--workspace",
              help="scratch | worktree | worktree:<path> | dir:<path> (default: scratch; "
                   "an explicit 'scratch' also opts out of a project-scoped board's project)"),
@@ -229,6 +250,7 @@ _SPECS = [
         _arg("--workflow-template-id", metavar="ID", help="Restrict to tasks with this workflow_template_id"),
         _arg("--step-key", dest="current_step_key", metavar="KEY",
              help="Restrict to tasks with this current_step_key"),
+        _arg("--group", help="Restrict to tasks grouped under this task id (organizational filter only)"),
     ], aliases=["ls"], help="List tasks"),
     _cmd("show", [_TASK_ID, _json_flag(), *_run_state_args("filter listed runs by task_runs column")],
          help="Show a task with comments + events"),
@@ -257,6 +279,15 @@ _SPECS = [
     ], aliases=["diag"], help="List active diagnostics on the current board"),
     _cmd("link", [_arg("parent_id"), _arg("child_id")], help="Add a parent->child dependency"),
     _cmd("unlink", [_arg("parent_id"), _arg("child_id")], help="Remove a parent->child dependency"),
+    _cmd("group", children=("group_action", _GROUP_SPECS),
+         help="Organizational grouping — containment, never a scheduling dependency",
+         description=(
+             "Group membership records that a task BELONGS TO another task (an EPIC / "
+             "LOOP / GENERATION card) for visibility. It is deliberately separate from "
+             "`link`: a parent link is an execution dependency that gates dispatch, a "
+             "group is a label that never does. `unlink` does not remove group "
+             "membership, and removing a group does not alter dependencies."
+         )),
     _cmd("claim", [
         _TASK_ID,
         _arg("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS, help="Claim TTL in seconds (default: 900)"),

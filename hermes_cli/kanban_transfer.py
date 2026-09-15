@@ -48,7 +48,7 @@ ARCHIVE_FORMAT_VERSION = 1
 # if it is in one of these — terminal and already-parked tasks are left
 # alone rather than having their history rewritten.
 _DISPATCHABLE_STATUSES = ("ready", "running", "todo", "scheduled")
-_COUNTED_TABLES = ("tasks", "task_links", "task_comments", "task_events", "task_runs", "task_attachments")
+_COUNTED_TABLES = ("tasks", "task_links", "task_groups", "task_comments", "task_events", "task_runs", "task_attachments")
 
 
 def _placeholders(items) -> str:
